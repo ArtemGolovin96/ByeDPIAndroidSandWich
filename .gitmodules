@@ -2,5 +2,5 @@
 	path = app/src/main/jni/hev-socks5-tunnel
 	url = https://github.com/heiher/hev-socks5-tunnel.git
 [submodule "byedpi"]
-	path = app/src/main/cpp/byedpi
-	url = https://github.com/hufrea/byedpi.git
+    path = app/src/main/cpp/byedpi
+    url = https://github.com/ArtemGolovin96/byedpiSandWich.git
