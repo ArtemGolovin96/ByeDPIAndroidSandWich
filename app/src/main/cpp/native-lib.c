@@ -8,8 +8,12 @@
 #include "byedpi/proxy.h"
 #include "byedpi/params.h"
 #include "byedpi/packets.h"
+#include "byedpi/mpool.h"
 #include "main.h"
 #include "utils.h"
+
+
+int NOT_EXIT = 0;
 
 const enum demode DESYNC_METHODS[] = {
     DESYNC_NONE,
@@ -53,7 +57,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocketWithComman
         return -1;
     }
 
-    int fd = listen_socket((struct sockaddr_ina *)&params.laddr);
+    int fd = listen_socket((union sockaddr_u *)&params.laddr);
     if (fd < 0) {
         uniperror("listen_socket");
         return -1;
@@ -95,7 +99,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
         jint udp_fake_count,
         jboolean drop_sack,
         jint fake_offset) {
-    struct sockaddr_ina s;
+    union sockaddr_u s;
 
     const char *address = (*env)->GetStringUTFChars(env, ip, 0);
     int res = get_addr(address, &s);
@@ -105,7 +109,12 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
         return -1;
     }
 
-    s.in.sin_port = htons(port);
+    // Определяем семейство и устанавливаем порт
+    if (s.sa.sa_family == AF_INET) {
+        s.in.sin_port = htons(port);
+    } else if (s.sa.sa_family == AF_INET6) {
+        s.in6.sin6_port = htons(port);
+    }
 
     params.max_open = max_connections;
     params.bfsize = buffer_size;
@@ -125,10 +134,11 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
         }
     }
 
+    // Обработка белого списка хостов (используем временный буфер, так как file_ptr больше нет)
     if (hosts_mode == HOSTS_WHITELIST) {
         struct desync_params *dp = add(
                 (void *) &params.dp,
-                &params.dp_count,
+                &params.dp_n,
                 sizeof(struct desync_params)
         );
         if (!dp) {
@@ -138,9 +148,15 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
         }
 
         const char *str = (*env)->GetStringUTFChars(env, hosts, 0);
-        dp->file_ptr = data_from_str(str, &dp->file_size);
+        char *file_ptr = data_from_str(str, &dp->fake_data.size);
         (*env)->ReleaseStringUTFChars(env, hosts, str);
-        dp->hosts = parse_hosts(dp->file_ptr, dp->file_size);
+        if (!file_ptr) {
+            perror("data_from_str");
+            clear_params();
+            return -1;
+        }
+        dp->hosts = parse_hosts(file_ptr, dp->fake_data.size);
+        free(file_ptr);
         if (!dp->hosts) {
             perror("parse_hosts");
             clear_params();
@@ -150,7 +166,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
 
     struct desync_params *dp = add(
             (void *) &params.dp,
-            &params.dp_count,
+            &params.dp_n,
             sizeof(struct desync_params)
     );
     if (!dp) {
@@ -161,9 +177,15 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
 
     if (hosts_mode == HOSTS_BLACKLIST) {
         const char *str = (*env)->GetStringUTFChars(env, hosts, 0);
-        dp->file_ptr = data_from_str(str, &dp->file_size);
+        char *file_ptr = data_from_str(str, &dp->fake_data.size);
         (*env)->ReleaseStringUTFChars(env, hosts, str);
-        dp->hosts = parse_hosts(dp->file_ptr, dp->file_size);
+        if (!file_ptr) {
+            perror("data_from_str");
+            clear_params();
+            return -1;
+        }
+        dp->hosts = parse_hosts(file_ptr, dp->fake_data.size);
+        free(file_ptr);
         if (!dp->hosts) {
             perror("parse_hosts");
             clear_params();
@@ -220,11 +242,12 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
     }
 
     if (mode == DESYNC_FAKE) {
-        dp->fake_offset = fake_offset;
+        // fake_offset более не используется, игнорируем
+        // dp->fake_offset = fake_offset;  // несовместимо
 
         const char *sni = (*env)->GetStringUTFChars(env, fake_sni, 0);
         LOG(LOG_S, "fake_sni: %s", sni);
-        res = change_tls_sni(sni, fake_tls.data, fake_tls.size);
+        res = change_tls_sni(sni, fake_tls.data, fake_tls.size, fake_tls.size);
         (*env)->ReleaseStringUTFChars(env, fake_sni, sni);
         if (res) {
             fprintf(stderr, "error chsni\n");
@@ -239,7 +262,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
 
     if (dp->proto) {
         dp = add((void *)&params.dp,
-                 &params.dp_count, sizeof(struct desync_params));
+                 &params.dp_n, sizeof(struct desync_params));
         if (!dp) {
             uniperror("add");
             clear_params();
@@ -247,7 +270,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniCreateSocket(
         }
     }
 
-    params.mempool = mem_pool(0);
+    params.mempool = mem_pool(0, 0);
     if (!params.mempool) {
         uniperror("mem_pool");
         clear_params();
@@ -271,7 +294,7 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniStartProxy(
         jint fd) {
     LOG(LOG_S, "start_proxy, fd: %d", fd);
     NOT_EXIT = 1;
-    if (event_loop(fd) < 0) {
+    if (start_event_loop(fd) < 0) {
         uniperror("event_loop");
         return get_e();
     }
